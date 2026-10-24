@@ -39,6 +39,7 @@ _FIRMWARE_TRANSIENT_ERRORS = frozenset({"WRITE TMO", "READ TMO", "RESPONSE TMO",
 MODBUS_DEVICE_BUSY_EXCEPTION = 6
 MODBUS_GATEWAY_TARGET_FAILED_TO_RESPOND = 11
 WEB_API_MAX_REGISTERS_PER_REQUEST = 70
+WEB_API_INTER_CHUNK_DELAY = 0.25
 
 # Number of consecutive auth failures (rejected /auth/login or post-reauth
 # session-expired) tolerated by the WebAPI client before we surface the error
@@ -692,21 +693,55 @@ class SystemairWebApiClient(SystemairClientBase):
     async def async_get_data(self, reg: list[ModbusParameter]) -> Any:
         """Read modbus registers."""
         async with self._lock:
-            all_data = {}
+            all_data: dict[str, Any] = {}
+
+            # Deduplicate and sort registers by address so the IAM bridge reads
+            # Modbus addresses sequentially instead of jumping across the map.
+            seen_registers: set[int] = set()
+            ordered_regs: list[ModbusParameter] = []
+            for item in sorted(reg, key=lambda param: param.register):
+                if item.register not in seen_registers:
+                    seen_registers.add(item.register)
+                    ordered_regs.append(item)
+
+            if not ordered_regs:
+                return all_data
 
             # Split large blocks into smaller chunks to avoid 414 URI Too Long error
-            total_regs = len(reg)
+            total_regs = len(ordered_regs)
             chunks_needed = int((total_regs + self._max_registers_per_request - 1) // self._max_registers_per_request)
+            has_successful_read = False
+            last_error: Exception | None = None
 
             for chunk_idx in range(chunks_needed):
+                if chunk_idx > 0:
+                    await asyncio.sleep(WEB_API_INTER_CHUNK_DELAY)
+
                 start_idx = chunk_idx * self._max_registers_per_request
                 end_idx = min(start_idx + self._max_registers_per_request, total_regs)
-                chunk_regs = reg[start_idx:end_idx]
+                chunk_regs = ordered_regs[start_idx:end_idx]
 
                 query_params = ",".join(f"%22{item.register - 1}%22:1" for item in chunk_regs)
                 url = f"http://{self._address}/mread?{{{query_params}}}"
-                result = await self._api_wrapper(method="get", url=url, expects_data=True)
-                all_data.update(result)
+                try:
+                    result = await self._api_wrapper(method="get", url=url, expects_data=True)
+                except (SystemairAuthError, SystemairAuthExpiredError, SystemairAuthRequiredError):
+                    raise
+                except SystemairApiClientError as err:
+                    last_error = err
+                    LOGGER.warning(
+                        "Failed to read WebAPI register chunk %d/%d: %s",
+                        chunk_idx + 1,
+                        chunks_needed,
+                        err,
+                    )
+                    continue
+
+                has_successful_read = True
+                all_data.update({str(k): v for k, v in result.items()})
+
+            if not has_successful_read and last_error is not None:
+                raise last_error
 
             return all_data
 
@@ -787,6 +822,9 @@ class SystemairWebApiClient(SystemairClientBase):
         chunks_needed = int((count + self._max_registers_per_request - 1) // self._max_registers_per_request)
 
         for chunk_idx in range(chunks_needed):
+            if chunk_idx > 0:
+                await asyncio.sleep(WEB_API_INTER_CHUNK_DELAY)
+
             chunk_start = start + (chunk_idx * self._max_registers_per_request)
             chunk_count = min(self._max_registers_per_request, count - (chunk_idx * self._max_registers_per_request))
 
@@ -1038,7 +1076,7 @@ class SystemairWebApiClient(SystemairClientBase):
             except TimeoutError as exception:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2**attempt)
-                    LOGGER.warning(
+                    LOGGER.debug(
                         "Timeout on attempt %d/%d: %s. Retrying in %.2fs...",
                         attempt + 1,
                         max_retries,
@@ -1053,7 +1091,7 @@ class SystemairWebApiClient(SystemairClientBase):
             except (aiohttp.ClientError, socket.gaierror) as exception:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2**attempt)
-                    LOGGER.warning(
+                    LOGGER.debug(
                         "Connection error on attempt %d/%d: %s. Retrying in %.2fs...",
                         attempt + 1,
                         max_retries,
@@ -1069,7 +1107,7 @@ class SystemairWebApiClient(SystemairClientBase):
                 # Retry communication errors (MB DISCONNECTED, empty response, invalid JSON)
                 if attempt < max_retries - 1:
                     delay = base_delay * (2**attempt)
-                    LOGGER.warning(
+                    LOGGER.debug(
                         "Communication error on attempt %d/%d. Retrying in %.2fs...",
                         attempt + 1,
                         max_retries,

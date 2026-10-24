@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +36,9 @@ if TYPE_CHECKING:
     from .data import SystemairConfigEntry
     from .modbus import ModbusParameter
 
+TRANSIENT_FAILURE_THRESHOLD = 3
+POST_WRITE_REFRESH_COOLDOWN = 2.0
+
 
 class InvalidBooleanValueError(HomeAssistantError):
     """Exception raised for invalid boolean values."""
@@ -66,6 +70,8 @@ class SystemairDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.client.set_update_callback(self.async_set_updated_data_from_ws)
 
         self.modbus_parameters: list[ModbusParameter] = []
+        self._consecutive_update_failures = 0
+        self._last_write_refresh: float | None = None
 
         super().__init__(
             hass=hass,
@@ -167,6 +173,11 @@ class SystemairDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self.client.unit is not None:
                 self.async_set_updated_data(self.client.unit)
             return
+        now = time.monotonic()
+        last_refresh = getattr(self, "_last_write_refresh", None)
+        if last_refresh is not None and (now - last_refresh) < POST_WRITE_REFRESH_COOLDOWN:
+            return
+        self._last_write_refresh = now
         await self.async_request_refresh()
 
     async def set_modbus_data(self, register: ModbusParameter, value: Any) -> None:
@@ -184,6 +195,8 @@ class SystemairDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         try:
             await self.client.write_register(register.register, value_to_write)
+            if isinstance(getattr(self, "data", None), dict):
+                self.data[str(register.register - 1)] = value_to_write
             await self.async_refresh_after_write()
         except (SystemairAuthError, SystemairAuthExpiredError, SystemairAuthRequiredError) as exc:
             raise ConfigEntryAuthFailed(str(exc)) from exc
@@ -195,6 +208,9 @@ class SystemairDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Set the data for a 32-bit Modbus register."""
         try:
             await self.client.write_registers_32bit(register.register, value)
+            if isinstance(getattr(self, "data", None), dict):
+                self.data[str(register.register - 1)] = value & 0xFFFF
+                self.data[str(register.register)] = (value >> 16) & 0xFFFF
             await self.async_refresh_after_write()
         except (SystemairAuthError, SystemairAuthExpiredError, SystemairAuthRequiredError) as exc:
             raise ConfigEntryAuthFailed(str(exc)) from exc
@@ -237,21 +253,34 @@ class SystemairDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             enable_alarm_details = self.config_entry.options.get(CONF_ENABLE_ALARM_DETAILS, DEFAULT_ENABLE_ALARM_DETAILS)
             enable_alarm_history = self.config_entry.options.get(CONF_ENABLE_ALARM_HISTORY, DEFAULT_ENABLE_ALARM_HISTORY)
-            if self._is_webapi:
-                if self.modbus_parameters:
-                    return await self.client.async_get_data(self.modbus_parameters)
-                return await self.client.get_all_data(
+            if self._is_webapi and self.modbus_parameters:
+                new_data = await self.client.async_get_data(self.modbus_parameters)
+            else:
+                # For HomeSolution, get_all_data returns the VentilationUnit object
+                # For others, it returns a dict of registers
+                new_data = await self.client.get_all_data(
                     enable_alarm_details=enable_alarm_details,
                     enable_alarm_history=enable_alarm_history,
                 )
-
-            # For HomeSolution, get_all_data returns the VentilationUnit object
-            # For others, it returns a dict of registers
-            return await self.client.get_all_data(
-                enable_alarm_details=enable_alarm_details,
-                enable_alarm_history=enable_alarm_history,
-            )
         except (SystemairAuthError, SystemairAuthExpiredError, SystemairAuthRequiredError) as exception:
             raise ConfigEntryAuthFailed(str(exception)) from exception
         except (ModbusConnectionError, SystemairApiClientError) as exception:
+            failures = getattr(self, "_consecutive_update_failures", 0) + 1
+            self._consecutive_update_failures = failures
+            current_data = getattr(self, "data", None)
+            if current_data is not None and failures <= TRANSIENT_FAILURE_THRESHOLD:
+                LOGGER.warning(
+                    "Transient error fetching %s data (%d/%d); keeping cached state: %s",
+                    DOMAIN,
+                    failures,
+                    TRANSIENT_FAILURE_THRESHOLD,
+                    exception,
+                )
+                return current_data
             raise UpdateFailed(exception) from exception
+
+        self._consecutive_update_failures = 0
+        current_data = getattr(self, "data", None)
+        if isinstance(current_data, dict) and isinstance(new_data, dict):
+            return {**current_data, **new_data}
+        return new_data
