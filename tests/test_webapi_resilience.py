@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -33,10 +34,14 @@ def _make_coordinator(*, is_webapi: bool = True, initial_data: dict[str, int] | 
     coordinator.modbus_parameters = []
     coordinator._consecutive_update_failures = 0
     coordinator._last_write_refresh = None
+    coordinator._write_since_last_refresh = False
+    coordinator._trailing_refresh_handle = None
+    coordinator._trailing_refresh_task = None
     coordinator.config_entry = SimpleNamespace(options={})
-    coordinator.client = SimpleNamespace()
+    coordinator.client = SimpleNamespace(last_read_error=None)
     coordinator.async_request_refresh = AsyncMock()
     coordinator.async_set_updated_data = Mock()
+    coordinator.async_update_listeners = Mock()
     return coordinator
 
 
@@ -127,6 +132,38 @@ class WebApiClientResilienceTest(unittest.IsolatedAsyncioTestCase):
         ):
             await client.async_get_data(regs)
 
+    async def test_async_get_data_keeps_32bit_register_pairs_in_same_chunk(self) -> None:
+        """A 32-bit register pair is never split across a chunk boundary or half-updated."""
+        client = SystemairWebApiClient(address="192.168.1.50", session=Mock(), max_registers_per_request=2)
+        reg_single = parameter_map["REG_TC_SP"]
+        reg_32_low = parameter_map["REG_FILTER_REMAINING_TIME_L"]
+        reg_32_high = parameter_map["REG_FILTER_REMAINING_TIME_H"]
+
+        urls: list[str] = []
+        responses = [
+            {str(reg_single.register - 1): 210},
+            {str(reg_32_low.register - 1): 100, str(reg_32_high.register - 1): 1},
+        ]
+
+        async def fake_api_wrapper(*, url: str, **_kwargs: object) -> dict[str, int]:
+            urls.append(url)
+            return responses.pop(0)
+
+        client._api_wrapper = fake_api_wrapper  # type: ignore[method-assign]
+
+        with patch("custom_components.systemair.api.asyncio.sleep", AsyncMock()):
+            result = await client.async_get_data([reg_single, reg_32_low, reg_32_high])
+
+        assert len(urls) == 2
+        assert urls[0] == f"http://192.168.1.50/mread?{{%22{reg_single.register - 1}%22:1}}"
+        assert urls[1] == (f"http://192.168.1.50/mread?{{%22{reg_32_low.register - 1}%22:1,%22{reg_32_high.register - 1}%22:1}}")
+        assert result == {
+            str(reg_single.register - 1): 210,
+            str(reg_32_low.register - 1): 100,
+            str(reg_32_high.register - 1): 1,
+        }
+        assert client.last_read_error is None
+
 
 class CoordinatorResilienceTest(unittest.IsolatedAsyncioTestCase):
     """Verify coordinator grace period, partial merge, and write refresh coalescing."""
@@ -189,7 +226,48 @@ class CoordinatorResilienceTest(unittest.IsolatedAsyncioTestCase):
         await coordinator.async_refresh_after_write()
 
         assert coordinator.data[str(reg.register - 1)] == 220
+        coordinator.async_update_listeners.assert_called_once()
         coordinator.async_request_refresh.assert_awaited_once()
+
+    async def test_consecutive_partial_chunk_failures_raise_after_threshold(self) -> None:
+        """Repeated partial chunk failures are bounded by TRANSIENT_FAILURE_THRESHOLD."""
+        coordinator = _make_coordinator(initial_data={"1130": 1, "2000": 210})
+        coordinator.modbus_parameters = [parameter_map["REG_TC_SP"]]
+        coordinator.client.async_get_data = AsyncMock(return_value={"2000": 225})
+        coordinator.client.last_read_error = SystemairApiClientCommunicationError("MB DISCONNECTED")
+
+        for attempt in range(1, TRANSIENT_FAILURE_THRESHOLD + 1):
+            with self.assertLogs("custom_components.systemair", level="WARNING"):
+                merged = await coordinator._async_update_data()
+            assert merged == {"1130": 1, "2000": 225}
+            assert coordinator._consecutive_update_failures == attempt
+
+        with self.assertRaises(UpdateFailed):  # noqa: PT027
+            await coordinator._async_update_data()
+        assert coordinator.data == {"1130": 1, "2000": 225}
+
+    async def test_second_write_during_cooldown_schedules_trailing_refresh(self) -> None:
+        """A second write inside the cooldown window schedules one trailing refresh."""
+        coordinator = _make_coordinator(initial_data={"2000": 200, "12101": 150})
+        coordinator.client.write_register = AsyncMock()
+        reg_first = parameter_map["REG_TC_SP"]
+        reg_second = parameter_map["REG_SENSOR_SAT"]
+
+        with patch("custom_components.systemair.coordinator.POST_WRITE_REFRESH_COOLDOWN", 0.05):
+            await coordinator.set_modbus_data(reg_first, 22)
+            await coordinator.async_refresh_after_write()
+            assert coordinator.async_request_refresh.await_count == 1
+
+            await coordinator.set_modbus_data(reg_second, 18)
+            await coordinator.async_refresh_after_write()
+            assert coordinator.async_request_refresh.await_count == 1
+            assert coordinator._trailing_refresh_handle is not None
+
+            await asyncio.sleep(0.08)
+            if coordinator._trailing_refresh_task is not None:
+                await coordinator._trailing_refresh_task
+
+        assert coordinator.async_request_refresh.await_count == 2
 
 
 if __name__ == "__main__":

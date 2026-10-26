@@ -645,6 +645,7 @@ class SystemairWebApiClient(SystemairClientBase):
         self._authenticated = False
         self._defer_auth_errors = defer_auth_errors
         self._consecutive_auth_failures = 0
+        self.last_read_error: Exception | None = None
         self.read_blocks = SAVE_PROFILE.read_blocks
         self.alarm_detail_blocks = SAVE_PROFILE.alarm_detail_blocks
         self.alarm_history_blocks = SAVE_PROFILE.alarm_history_blocks
@@ -690,38 +691,90 @@ class SystemairWebApiClient(SystemairClientBase):
         """Get information from the API."""
         return await self._api_wrapper(method="get", url=f"http://{self._address}/{endpoint}")
 
+    def _build_register_chunks(self, reg: list[ModbusParameter]) -> list[list[ModbusParameter]]:
+        """Deduplicate, sort, and split registers into chunks keeping 32-bit pairs together."""
+        seen_registers: set[int] = set()
+        ordered_regs: list[ModbusParameter] = []
+        for item in sorted(reg, key=lambda param: param.register):
+            if item.register not in seen_registers:
+                seen_registers.add(item.register)
+                ordered_regs.append(item)
+
+        if not ordered_regs:
+            return []
+
+        reg_by_address = {item.register: item for item in ordered_regs}
+        paired_addresses: set[int] = set()
+        register_groups: list[list[ModbusParameter]] = []
+        for item in ordered_regs:
+            if item.register in paired_addresses:
+                continue
+            companion_addr = item.combine_with_32_bit
+            if companion_addr is not None and companion_addr != item.register:
+                paired_addresses.add(item.register)
+                paired_addresses.add(companion_addr)
+                companion = reg_by_address.get(companion_addr)
+                group = sorted([item, companion], key=lambda param: param.register) if companion is not None else [item]
+                register_groups.append(group)
+            else:
+                register_groups.append([item])
+
+        chunks: list[list[ModbusParameter]] = []
+        current_chunk: list[ModbusParameter] = []
+        current_chunk_size = 0
+        for group in register_groups:
+            group_size = 2 if group[0].combine_with_32_bit is not None else len(group)
+            if current_chunk and current_chunk_size + group_size > self._max_registers_per_request:
+                chunks.append(current_chunk)
+                current_chunk = list(group)
+                current_chunk_size = group_size
+            else:
+                current_chunk.extend(group)
+                current_chunk_size += group_size
+        if current_chunk:
+            chunks.append(current_chunk)
+        return chunks
+
+    @staticmethod
+    def _extract_chunk_data(chunk_regs: list[ModbusParameter], result: dict[str, Any]) -> dict[str, Any]:
+        """Convert chunk response keys to strings and drop incomplete 32-bit register pairs."""
+        chunk_data = {str(k): v for k, v in result.items()}
+        for item in chunk_regs:
+            if item.combine_with_32_bit is not None:
+                low_key = str(item.register - 1)
+                high_key = str(item.combine_with_32_bit - 1)
+                if low_key not in chunk_data or high_key not in chunk_data:
+                    chunk_data.pop(low_key, None)
+                    chunk_data.pop(high_key, None)
+        return chunk_data
+
     async def async_get_data(self, reg: list[ModbusParameter]) -> Any:
         """Read modbus registers."""
         async with self._lock:
             all_data: dict[str, Any] = {}
-
-            # Deduplicate and sort registers by address so the IAM bridge reads
-            # Modbus addresses sequentially instead of jumping across the map.
-            seen_registers: set[int] = set()
-            ordered_regs: list[ModbusParameter] = []
-            for item in sorted(reg, key=lambda param: param.register):
-                if item.register not in seen_registers:
-                    seen_registers.add(item.register)
-                    ordered_regs.append(item)
-
-            if not ordered_regs:
+            self.last_read_error = None
+            chunks = self._build_register_chunks(reg)
+            if not chunks:
                 return all_data
 
-            # Split large blocks into smaller chunks to avoid 414 URI Too Long error
-            total_regs = len(ordered_regs)
-            chunks_needed = int((total_regs + self._max_registers_per_request - 1) // self._max_registers_per_request)
+            chunks_needed = len(chunks)
             has_successful_read = False
             last_error: Exception | None = None
 
-            for chunk_idx in range(chunks_needed):
+            for chunk_idx, chunk_regs in enumerate(chunks):
                 if chunk_idx > 0:
                     await asyncio.sleep(WEB_API_INTER_CHUNK_DELAY)
 
-                start_idx = chunk_idx * self._max_registers_per_request
-                end_idx = min(start_idx + self._max_registers_per_request, total_regs)
-                chunk_regs = ordered_regs[start_idx:end_idx]
-
-                query_params = ",".join(f"%22{item.register - 1}%22:1" for item in chunk_regs)
+                chunk_addresses = list(
+                    dict.fromkeys(
+                        addr
+                        for item in chunk_regs
+                        for addr in (
+                            (item.register, item.combine_with_32_bit) if item.combine_with_32_bit is not None else (item.register,)
+                        )
+                    )
+                )
+                query_params = ",".join(f"%22{addr - 1}%22:1" for addr in chunk_addresses)
                 url = f"http://{self._address}/mread?{{{query_params}}}"
                 try:
                     result = await self._api_wrapper(method="get", url=url, expects_data=True)
@@ -738,8 +791,9 @@ class SystemairWebApiClient(SystemairClientBase):
                     continue
 
                 has_successful_read = True
-                all_data.update({str(k): v for k, v in result.items()})
+                all_data.update(self._extract_chunk_data(chunk_regs, result))
 
+            self.last_read_error = last_error
             if not has_successful_read and last_error is not None:
                 raise last_error
 

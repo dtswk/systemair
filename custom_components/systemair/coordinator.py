@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -72,6 +73,9 @@ class SystemairDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.modbus_parameters: list[ModbusParameter] = []
         self._consecutive_update_failures = 0
         self._last_write_refresh: float | None = None
+        self._write_since_last_refresh = False
+        self._trailing_refresh_handle: asyncio.TimerHandle | None = None
+        self._trailing_refresh_task: asyncio.Task[None] | None = None
 
         super().__init__(
             hass=hass,
@@ -167,6 +171,32 @@ class SystemairDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Return whether the active transport can write both halves of a value."""
         return not self._is_homesolution or self.client.can_write_registers_32bit(register)
 
+    def _schedule_trailing_write_refresh(self, delay: float) -> None:
+        """Schedule a single coalesced refresh after the write cooldown expires."""
+        if getattr(self, "_trailing_refresh_handle", None) is not None:
+            return
+
+        loop = asyncio.get_running_loop()
+
+        def _trigger_refresh() -> None:
+            self._trailing_refresh_handle = None
+            task_coro = self._async_run_trailing_write_refresh()
+            hass = getattr(self, "hass", None)
+            if hass is not None and hasattr(hass, "async_create_task"):
+                self._trailing_refresh_task = hass.async_create_task(task_coro)
+            else:
+                self._trailing_refresh_task = loop.create_task(task_coro)
+
+        self._trailing_refresh_handle = loop.call_later(delay, _trigger_refresh)
+
+    async def _async_run_trailing_write_refresh(self) -> None:
+        """Execute a trailing refresh queued during the write cooldown."""
+        if not getattr(self, "_write_since_last_refresh", False):
+            return
+        self._write_since_last_refresh = False
+        self._last_write_refresh = time.monotonic()
+        await self.async_request_refresh()
+
     async def async_refresh_after_write(self) -> None:
         """Publish cloud readback locally or refresh the active local transport."""
         if self._is_homesolution:
@@ -176,7 +206,15 @@ class SystemairDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         now = time.monotonic()
         last_refresh = getattr(self, "_last_write_refresh", None)
         if last_refresh is not None and (now - last_refresh) < POST_WRITE_REFRESH_COOLDOWN:
+            if getattr(self, "_write_since_last_refresh", False):
+                remaining = max(0.0, POST_WRITE_REFRESH_COOLDOWN - (now - last_refresh))
+                self._schedule_trailing_write_refresh(remaining)
             return
+        existing_handle = getattr(self, "_trailing_refresh_handle", None)
+        if existing_handle is not None:
+            existing_handle.cancel()
+            self._trailing_refresh_handle = None
+        self._write_since_last_refresh = False
         self._last_write_refresh = now
         await self.async_request_refresh()
 
@@ -197,6 +235,9 @@ class SystemairDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self.client.write_register(register.register, value_to_write)
             if isinstance(getattr(self, "data", None), dict):
                 self.data[str(register.register - 1)] = value_to_write
+                if hasattr(self, "async_update_listeners"):
+                    self.async_update_listeners()
+            self._write_since_last_refresh = True
             await self.async_refresh_after_write()
         except (SystemairAuthError, SystemairAuthExpiredError, SystemairAuthRequiredError) as exc:
             raise ConfigEntryAuthFailed(str(exc)) from exc
@@ -211,6 +252,9 @@ class SystemairDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if isinstance(getattr(self, "data", None), dict):
                 self.data[str(register.register - 1)] = value & 0xFFFF
                 self.data[str(register.register)] = (value >> 16) & 0xFFFF
+                if hasattr(self, "async_update_listeners"):
+                    self.async_update_listeners()
+            self._write_since_last_refresh = True
             await self.async_refresh_after_write()
         except (SystemairAuthError, SystemairAuthExpiredError, SystemairAuthRequiredError) as exc:
             raise ConfigEntryAuthFailed(str(exc)) from exc
@@ -279,8 +323,25 @@ class SystemairDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return current_data
             raise UpdateFailed(exception) from exception
 
-        self._consecutive_update_failures = 0
         current_data = getattr(self, "data", None)
-        if isinstance(current_data, dict) and isinstance(new_data, dict):
-            return {**current_data, **new_data}
-        return new_data
+        merged_data = {**current_data, **new_data} if isinstance(current_data, dict) and isinstance(new_data, dict) else new_data
+        partial_error = getattr(self.client, "last_read_error", None) if self._is_webapi else None
+
+        if partial_error is not None:
+            failures = getattr(self, "_consecutive_update_failures", 0) + 1
+            self._consecutive_update_failures = failures
+            if current_data is not None and failures <= TRANSIENT_FAILURE_THRESHOLD:
+                LOGGER.warning(
+                    "Partial error fetching %s data (%d/%d); keeping cached state for failed chunks: %s",
+                    DOMAIN,
+                    failures,
+                    TRANSIENT_FAILURE_THRESHOLD,
+                    partial_error,
+                )
+                return merged_data
+            if isinstance(merged_data, dict):
+                self.data = merged_data
+            raise UpdateFailed(partial_error) from partial_error
+
+        self._consecutive_update_failures = 0
+        return merged_data
